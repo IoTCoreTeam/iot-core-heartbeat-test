@@ -1,21 +1,21 @@
 # heartbeat_test
 
-MQTT heartbeat simulator for the flow: controller  gateway  server.
+MQTT heartbeat simulator for the flow: controller gateway server.
 
 ## Structure
 
 ```
 heartbeat_test/
-test_controller.js   # Controller heartbeat sender
-test_gateway.js      # Gateway relay + heartbeat
-package.json
+test_controller.js   # Controller heartbeat sender
+test_gateway.js      # Gateway relay + heartbeat
+package.json
 ```
 
 ## Topics / Flow
 
-- Controller  `esp32/gateway/controller`
-- Gateway      `esp32/controllers/heartbeat`
-- Gateway HB   `esp32/heartbeat`
+- Controller  `esp32/gateway/controller`
+- Gateway      `esp32/controllers/heartbeat`
+- Gateway HB   `esp32/heartbeat`
 
 ## Install
 
