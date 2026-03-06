@@ -2,6 +2,9 @@ const mqtt = require('mqtt');
 
 const BROKER = process.env.MQTT_BROKER || 'mqtt://localhost:1883';
 const TOPIC = process.env.CONTROLLER_TO_GATEWAY_TOPIC || 'esp32/gateway/controller';
+const COMMAND_TOPIC_PREFIX = process.env.CONTROL_COMMAND_TOPIC_PREFIX || 'esp32/commands';
+const GATEWAY_ID = process.env.GATEWAY_ID || 'GW_001';
+const COMMAND_TOPIC = process.env.CONTROL_COMMAND_TOPIC || `${COMMAND_TOPIC_PREFIX}/${GATEWAY_ID}`;
 const INTERVAL_MS = Number(process.env.INTERVAL_MS || 5000);
 const ONCE = process.argv.includes('--once');
 
@@ -17,13 +20,10 @@ const DEVICES = {
 };
 
 let seq = 0;
-let digitalOn = true;
-let analogValue = 64;
+let digitalOn = false;
+let analogValue = 0;
 
-function nextDevices() {
-  digitalOn = !digitalOn;
-  analogValue = (analogValue + 32) % 256;
-
+function currentDevices() {
   return [
     { ...DEVICES.digital, state: digitalOn ? 'on' : 'off' },
     { ...DEVICES.analog, state: analogValue },
@@ -42,7 +42,7 @@ function buildStatusKv(devices) {
 
 function buildPayload() {
   const now = new Date();
-  const devices = nextDevices();
+  const devices = currentDevices();
   seq += 1;
   return {
     node_id: CONTROLLER.id,
@@ -59,6 +59,40 @@ function buildPayload() {
       state: d.state,
     })),
   };
+}
+
+function normalizeDigitalState(value) {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') return value !== 0;
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (['on', 'true', '1', 'open', 'opened', 'enabled'].includes(normalized)) return true;
+    if (['off', 'false', '0', 'close', 'closed', 'disabled'].includes(normalized)) return false;
+  }
+  return null;
+}
+
+function applyCommand(command) {
+  if (!command || typeof command !== 'object') return;
+  if (command.node_id && command.node_id !== CONTROLLER.id) return;
+
+  if (command.device === DEVICES.digital.device) {
+    const next = normalizeDigitalState(command.state);
+    if (typeof next === 'boolean') {
+      digitalOn = next;
+      console.log(
+        `[OK] command digital ${DEVICES.digital.device} -> ${digitalOn ? 'on' : 'off'}`
+      );
+    }
+  }
+
+  if (command.device === DEVICES.analog.device) {
+    const value = Number(command.value ?? command.state);
+    if (Number.isFinite(value)) {
+      analogValue = value;
+      console.log(`[OK] command analog ${DEVICES.analog.device} -> ${analogValue}`);
+    }
+  }
 }
 
 const client = mqtt.connect(BROKER, {
@@ -80,10 +114,29 @@ function publishOnce() {
 
 client.on('connect', () => {
   console.log(`Connected to ${BROKER}`);
+  client.subscribe(COMMAND_TOPIC, { qos: 1 }, (err) => {
+    if (err) {
+      console.error(`[ERR] subscribe ${COMMAND_TOPIC}: ${err.message}`);
+    } else {
+      console.log(`Subscribed to ${COMMAND_TOPIC}`);
+    }
+  });
   publishOnce();
   if (!ONCE) {
     setInterval(publishOnce, INTERVAL_MS);
   }
+});
+
+client.on('message', (topic, payloadBuf) => {
+  if (topic !== COMMAND_TOPIC) return;
+  let payload;
+  try {
+    payload = JSON.parse(payloadBuf.toString());
+  } catch (err) {
+    console.error('[ERR] invalid command payload:', err.message);
+    return;
+  }
+  applyCommand(payload);
 });
 
 client.on('error', (err) => {
