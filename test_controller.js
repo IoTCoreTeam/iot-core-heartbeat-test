@@ -19,6 +19,9 @@ const DEVICES = {
   analog: { device: process.env.ANALOG_DEVICE || 'fan_speed', kind: 'analog' },
 };
 
+const NEO6_BASE_LAT = 20.8449;
+const NEO6_BASE_LNG = 106.6881;
+
 let seq = 0;
 let digitalOn = false;
 let analogValue = 0;
@@ -44,6 +47,13 @@ function buildPayload() {
   const now = new Date();
   const devices = currentDevices();
   seq += 1;
+  const neo6 = {
+    lat: Number.isFinite(NEO6_BASE_LAT) ? NEO6_BASE_LAT : 0,
+    lng: Number.isFinite(NEO6_BASE_LNG) ? NEO6_BASE_LNG : 0,
+    satellites: 9,
+    hdop: 0.8,
+    timestamp: now.toISOString(),
+  };
   return {
     node_id: CONTROLLER.id,
     node_name: CONTROLLER.name,
@@ -52,6 +62,7 @@ function buildPayload() {
     uptime: Math.floor(process.uptime()),
     heartbeat_seq: seq,
     sensor_timestamp: now.toISOString(),
+    neo6,
     status_kv: buildStatusKv(devices),
     controller_states: devices.map((d) => ({
       device: d.device,
@@ -103,6 +114,7 @@ const client = mqtt.connect(BROKER, {
 
 function publishOnce() {
   const payload = buildPayload();
+  console.log("[heartbeat_test] node heartbeat payload:", JSON.stringify(payload));
   client.publish(TOPIC, JSON.stringify(payload), { qos: 1 }, (err) => {
     if (err) {
       console.error(`[ERR] controller -> gateway: ${err.message}`);

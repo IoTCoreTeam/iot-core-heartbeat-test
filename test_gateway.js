@@ -81,6 +81,14 @@ function buildControllerHeartbeat(controllerPayload) {
     sensor_timestamp: controllerPayload.sensor_timestamp || now.toISOString(),
     status_kv: controllerPayload.status_kv || null,
     controller_states: controllerStates,
+    gps: controllerPayload.gps ?? null,
+    lat: controllerPayload.lat ?? null,
+    lng: controllerPayload.lng ?? null,
+    latitude: controllerPayload.latitude ?? null,
+    longitude: controllerPayload.longitude ?? null,
+    connected_nodes: Array.isArray(controllerPayload.connected_nodes)
+      ? controllerPayload.connected_nodes
+      : null,
   };
 }
 
