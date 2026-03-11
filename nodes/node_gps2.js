@@ -1,4 +1,4 @@
-﻿const mqtt = require('mqtt');
+const mqtt = require('mqtt');
 
 const BROKER = 'mqtt://localhost:1883';
 const TOPIC = 'esp32/gateway/controller';
@@ -20,7 +20,7 @@ let seq = 0;
 
 function pickConnectedNodes() {
   const pool = ALL_NODE_IDS.filter((nodeId) => nodeId !== NODE.id);
-  const count = Math.floor(Math.random() * 3) + 3; // 3 to 5
+  const count = Math.floor(Math.random() * 2) + 2; // 2 to 3
   const shuffled = pool.sort(() => Math.random() - 0.5);
   return shuffled.slice(0, count);
 }
