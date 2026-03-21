@@ -1,161 +1,246 @@
-const mqtt = require('mqtt');
+const mqtt = require('mqtt')
 
-const BROKER = process.env.MQTT_BROKER || 'mqtt://localhost:1883';
-const TOPIC = process.env.CONTROLLER_TO_GATEWAY_TOPIC || 'esp32/gateway/controller';
-const COMMAND_TOPIC_PREFIX = process.env.CONTROL_COMMAND_TOPIC_PREFIX || 'esp32/commands';
-const GATEWAY_ID = process.env.GATEWAY_ID || 'GW_001';
-const COMMAND_TOPIC = process.env.CONTROL_COMMAND_TOPIC || `${COMMAND_TOPIC_PREFIX}/${GATEWAY_ID}`;
-const INTERVAL_MS = Number(process.env.INTERVAL_MS || 5000);
-const ONCE = process.argv.includes('--once');
+const BROKER = process.env.MQTT_BROKER || 'mqtt://localhost:1883'
+const GATEWAY_TO_CONTROLLER_TOPIC =
+  process.env.GATEWAY_TO_CONTROLLER_TOPIC || 'esp32/gateway/control-command'
+const CONTROLLER_TO_GATEWAY_TOPIC =
+  process.env.CONTROLLER_TO_GATEWAY_TOPIC || 'esp32/gateway/controller-updates'
+const HEARTBEAT_INTERVAL_MS = Number(process.env.INTERVAL_MS || 5000)
+const ONCE = process.argv.includes('--once')
+
+const GATEWAY = {
+  id: process.env.GATEWAY_ID || 'GW_001',
+  ip: process.env.GATEWAY_IP || '192.168.1.249',
+  mac: process.env.GATEWAY_MAC || '00:70:07:E6:7D:14'
+}
 
 const CONTROLLER = {
   id: process.env.NODE_ID || 'node-control-001',
   name: process.env.NODE_NAME || 'Control Node #1',
   mac: process.env.NODE_MAC || '24:6F:28:AA:BB:01',
-};
+  sensorId: process.env.DEVICE_ID || 'actuator-control-001'
+}
 
 const DEVICES = {
-  digital: { device: process.env.DIGITAL_DEVICE || 'pump', kind: 'digital' },
-  analog: { device: process.env.ANALOG_DEVICE || 'fan_speed', kind: 'analog' },
-};
+  primary: process.env.DIGITAL_DEVICE || 'pump',
+  secondary: process.env.SECONDARY_DIGITAL_DEVICE || 'light'
+}
 
-const NEO6_BASE_LAT = 20.8449;
-const NEO6_BASE_LNG = 106.6881;
+let heartbeatSeq = 0
+let eventSeq = 0
+let fallbackCommandSeq = 0
 
-let seq = 0;
-let digitalOn = false;
-let analogValue = 0;
+let primaryOn = false
+let secondaryOn = false
 
-function currentDevices() {
+function currentDeviceStates() {
   return [
-    { ...DEVICES.digital, state: digitalOn ? 'on' : 'off' },
-    { ...DEVICES.analog, state: analogValue },
-  ];
+    { device: DEVICES.primary, kind: 'digital', state: primaryOn ? 'on' : 'off' },
+    { device: DEVICES.secondary, kind: 'digital', state: secondaryOn ? 'on' : 'off' }
+  ]
 }
 
-function buildStatusKv(devices) {
-  const parts = ['v=1'];
-  devices.forEach((d) => {
-    parts.push(`d=${d.device}`);
-    parts.push(`k=${d.kind}`);
-    parts.push(`s=${String(d.state)}`);
-  });
-  return parts.join(';');
-}
+function buildStatusKv(states, commandMeta = null) {
+  const parts = ['v=1']
 
-function buildPayload() {
-  const now = new Date();
-  const devices = currentDevices();
-  seq += 1;
-  const neo6 = {
-    lat: Number.isFinite(NEO6_BASE_LAT) ? NEO6_BASE_LAT : 0,
-    lng: Number.isFinite(NEO6_BASE_LNG) ? NEO6_BASE_LNG : 0,
-    satellites: 9,
-    hdop: 0.8,
-    timestamp: now.toISOString(),
-  };
-  return {
-    node_id: CONTROLLER.id,
-    node_name: CONTROLLER.name,
-    node_mac: CONTROLLER.mac,
-    status: 'online',
-    uptime: Math.floor(process.uptime()),
-    heartbeat_seq: seq,
-    sensor_timestamp: now.toISOString(),
-    neo6,
-    status_kv: buildStatusKv(devices),
-    controller_states: devices.map((d) => ({
-      device: d.device,
-      kind: d.kind,
-      state: d.state,
-    })),
-  };
+  if (commandMeta) {
+    parts.push(`cmd=${String(commandMeta.seq)}`)
+    parts.push(`ce=${String(commandMeta.execMs)}`)
+    parts.push(`cd=${String(commandMeta.device)}`)
+    parts.push(`ct=${String(commandMeta.state)}`)
+    parts.push(`cr=${String(commandMeta.result)}`)
+  }
+
+  for (const state of states) {
+    parts.push(`d=${state.device}`)
+    parts.push(`k=${state.kind}`)
+    parts.push(`s=${state.state}`)
+  }
+
+  return parts.join(';')
 }
 
 function normalizeDigitalState(value) {
-  if (typeof value === 'boolean') return value;
-  if (typeof value === 'number') return value !== 0;
-  if (typeof value === 'string') {
-    const normalized = value.trim().toLowerCase();
-    if (['on', 'true', '1', 'open', 'opened', 'enabled'].includes(normalized)) return true;
-    if (['off', 'false', '0', 'close', 'closed', 'disabled'].includes(normalized)) return false;
-  }
-  return null;
+  const normalized = String(value || '').trim().toLowerCase()
+  if (normalized === 'on') return true
+  if (normalized === 'off') return false
+  return null
 }
 
 function applyCommand(command) {
-  if (!command || typeof command !== 'object') return;
-  if (command.node_id && command.node_id !== CONTROLLER.id) return;
+  if (!command || typeof command !== 'object') {
+    return null
+  }
 
-  if (command.device === DEVICES.digital.device) {
-    const next = normalizeDigitalState(command.state);
-    if (typeof next === 'boolean') {
-      digitalOn = next;
-      console.log(
-        `[OK] command digital ${DEVICES.digital.device} -> ${digitalOn ? 'on' : 'off'}`
-      );
+  const nodeId = String(command.node_id || CONTROLLER.id)
+  if (nodeId !== CONTROLLER.id) {
+    return null
+  }
+
+  const startedAt = Date.now()
+  const device = String(command.device || '')
+  const seq = Number(command.command_seq) > 0 ? Number(command.command_seq) : ++fallbackCommandSeq
+  const requestedState = String(command.state || '').toLowerCase()
+
+  let result = 'unknown_device'
+  let appliedState = requestedState
+
+  if (device === DEVICES.primary) {
+    const next = normalizeDigitalState(requestedState)
+    if (next === null) {
+      result = 'invalid_state'
+    } else {
+      primaryOn = next
+      result = 'applied'
+      appliedState = next ? 'on' : 'off'
+    }
+  } else if (device === DEVICES.secondary) {
+    const next = normalizeDigitalState(requestedState)
+    if (next === null) {
+      result = 'invalid_state'
+    } else {
+      secondaryOn = next
+      result = 'applied'
+      appliedState = next ? 'on' : 'off'
     }
   }
 
-  if (command.device === DEVICES.analog.device) {
-    const value = Number(command.value ?? command.state);
-    if (Number.isFinite(value)) {
-      analogValue = value;
-      console.log(`[OK] command analog ${DEVICES.analog.device} -> ${analogValue}`);
-    }
+  // Simulate controller processing time.
+  const jitterMs = Math.floor(Math.random() * 40)
+  const execMs = Date.now() - startedAt + jitterMs
+
+  return {
+    seq,
+    device,
+    state: appliedState,
+    result,
+    execMs
   }
+}
+
+function publishJson(client, topic, payload) {
+  client.publish(topic, JSON.stringify(payload), { qos: 1 }, (error) => {
+    if (error) {
+      console.error(`[ERR] publish ${topic}: ${error.message}`)
+      return
+    }
+    console.log(`[OK] publish ${topic}: ${JSON.stringify(payload)}`)
+  })
+}
+
+function buildHeartbeatPayload() {
+  const now = new Date().toISOString()
+  const controllerStates = currentDeviceStates()
+  heartbeatSeq += 1
+
+  return {
+    type: 'node_heartbeat',
+    gateway_id: GATEWAY.id,
+    gateway_ip: GATEWAY.ip,
+    gateway_mac: GATEWAY.mac,
+    node_id: CONTROLLER.id,
+    node_name: CONTROLLER.name,
+    node_mac: CONTROLLER.mac,
+    sensor_id: CONTROLLER.sensorId,
+    status: 'online',
+    uptime: Math.floor(process.uptime()),
+    heartbeat_seq: heartbeatSeq,
+    sensor_rssi: -45,
+    gateway_timestamp: now,
+    sensor_timestamp: now,
+    status_kv: buildStatusKv(controllerStates),
+    controller_states: controllerStates
+  }
+}
+
+function publishHeartbeat(client) {
+  publishJson(client, CONTROLLER_TO_GATEWAY_TOPIC, buildHeartbeatPayload())
+}
+
+function publishStatusEvent(client, command, commandResult) {
+  const now = new Date().toISOString()
+  const controllerStates = currentDeviceStates()
+  eventSeq += 1
+
+  const payload = {
+    type: 'controller_status_event',
+    gateway_id: command.gateway_id || GATEWAY.id,
+    gateway_ip: command.gateway_ip || GATEWAY.ip,
+    gateway_mac: command.gateway_mac || GATEWAY.mac,
+    node_id: CONTROLLER.id,
+    node_mac: CONTROLLER.mac,
+    sensor_id: CONTROLLER.sensorId,
+    event_seq: eventSeq,
+    sensor_rssi: -45,
+    sensor_timestamp: now,
+    gateway_timestamp: now,
+    status_kv: buildStatusKv(controllerStates, commandResult),
+    command_seq: commandResult.seq,
+    command_device: commandResult.device,
+    command_state: commandResult.state,
+    command_result: commandResult.result,
+    command_exec_ms: commandResult.execMs,
+    requested_at: command.requested_at || null,
+    requested_at_ms: command.requested_at_ms || null,
+    response_deadline_at: command.response_deadline_at || null,
+    controller_states: controllerStates
+  }
+
+  publishJson(client, CONTROLLER_TO_GATEWAY_TOPIC, payload)
 }
 
 const client = mqtt.connect(BROKER, {
   clientId: `controller_sim_${Math.random().toString(16).slice(2)}`,
   clean: true,
-  reconnectPeriod: 1000,
-});
-
-function publishOnce() {
-  const payload = buildPayload();
-  console.log("[heartbeat_test] node heartbeat payload:", JSON.stringify(payload));
-  client.publish(TOPIC, JSON.stringify(payload), { qos: 1 }, (err) => {
-    if (err) {
-      console.error(`[ERR] controller -> gateway: ${err.message}`);
-    } else {
-      console.log(`[OK] controller -> gateway (${TOPIC}) ${payload.node_id}`);
-    }
-  });
-}
+  reconnectPeriod: 1000
+})
 
 client.on('connect', () => {
-  console.log(`Connected to ${BROKER}`);
-  client.subscribe(COMMAND_TOPIC, { qos: 1 }, (err) => {
-    if (err) {
-      console.error(`[ERR] subscribe ${COMMAND_TOPIC}: ${err.message}`);
-    } else {
-      console.log(`Subscribed to ${COMMAND_TOPIC}`);
+  console.log(`Connected to ${BROKER}`)
+  client.subscribe(GATEWAY_TO_CONTROLLER_TOPIC, { qos: 1 }, (error) => {
+    if (error) {
+      console.error(`[ERR] subscribe ${GATEWAY_TO_CONTROLLER_TOPIC}: ${error.message}`)
+      return
     }
-  });
-  publishOnce();
+    console.log(`Subscribed to ${GATEWAY_TO_CONTROLLER_TOPIC}`)
+  })
+
+  publishHeartbeat(client)
   if (!ONCE) {
-    setInterval(publishOnce, INTERVAL_MS);
+    setInterval(() => publishHeartbeat(client), HEARTBEAT_INTERVAL_MS)
   }
-});
+})
 
 client.on('message', (topic, payloadBuf) => {
-  if (topic !== COMMAND_TOPIC) return;
-  let payload;
-  try {
-    payload = JSON.parse(payloadBuf.toString());
-  } catch (err) {
-    console.error('[ERR] invalid command payload:', err.message);
-    return;
+  if (topic !== GATEWAY_TO_CONTROLLER_TOPIC) {
+    return
   }
-  applyCommand(payload);
-});
 
-client.on('error', (err) => {
-  console.error('MQTT error:', err.message);
-  process.exitCode = 1;
-});
+  let command
+  try {
+    command = JSON.parse(payloadBuf.toString())
+  } catch (error) {
+    console.error(`[ERR] invalid command payload: ${error.message}`)
+    return
+  }
+
+  const result = applyCommand(command)
+  if (!result) {
+    console.log(`[SKIP] command is not for node ${CONTROLLER.id}`)
+    return
+  }
+
+  console.log(
+    `[CMD] node=${CONTROLLER.id} seq=${result.seq} device=${result.device} state=${result.state} result=${result.result} exec_ms=${result.execMs}`
+  )
+  publishStatusEvent(client, command, result)
+})
+
+client.on('error', (error) => {
+  console.error(`MQTT error: ${error.message}`)
+  process.exitCode = 1
+})
 
 process.on('SIGINT', () => {
-  client.end(true, () => process.exit(0));
-});
+  client.end(true, () => process.exit(0))
+})

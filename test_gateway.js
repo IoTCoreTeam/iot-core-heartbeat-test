@@ -1,148 +1,128 @@
-const mqtt = require('mqtt');
+const mqtt = require('mqtt')
 
-const BROKER = process.env.MQTT_BROKER || 'mqtt://localhost:1883';
-const INBOUND_TOPIC = process.env.CONTROLLER_TO_GATEWAY_TOPIC || 'esp32/gateway/controller';
-const OUTBOUND_TOPIC = process.env.GATEWAY_TO_SERVER_TOPIC || 'esp32/controllers/heartbeat';
-const GW_HEARTBEAT_TOPIC = process.env.GATEWAY_HEARTBEAT_TOPIC || 'esp32/heartbeat';
-const GW_HEARTBEAT_INTERVAL_MS = Number(process.env.GW_HEARTBEAT_INTERVAL_MS || 5000);
+const BROKER = process.env.MQTT_BROKER || 'mqtt://localhost:1883'
 
 const GATEWAY = {
   id: process.env.GATEWAY_ID || 'GW_001',
   ip: process.env.GATEWAY_IP || '192.168.1.249',
-  mac: process.env.GATEWAY_MAC || '00:70:07:E6:7D:14',
-};
+  mac: process.env.GATEWAY_MAC || '00:70:07:E6:7D:14'
+}
+
+const COMMAND_TOPIC_PREFIX = process.env.CONTROL_COMMAND_TOPIC_PREFIX || 'esp32/commands'
+const COMMAND_TOPIC = process.env.CONTROL_COMMAND_TOPIC || `${COMMAND_TOPIC_PREFIX}/${GATEWAY.id}`
+
+const GATEWAY_TO_CONTROLLER_TOPIC =
+  process.env.GATEWAY_TO_CONTROLLER_TOPIC || 'esp32/gateway/control-command'
+const CONTROLLER_TO_GATEWAY_TOPIC =
+  process.env.CONTROLLER_TO_GATEWAY_TOPIC || 'esp32/gateway/controller-updates'
+
+const SERVER_CONTROLLER_HEARTBEAT_TOPIC =
+  process.env.SERVER_CONTROLLER_HEARTBEAT_TOPIC || 'esp32/controllers/heartbeat'
+const SERVER_CONTROLLER_STATUS_EVENT_TOPIC =
+  process.env.SERVER_CONTROLLER_STATUS_EVENT_TOPIC || 'esp32/controllers/status-event'
+const SERVER_GATEWAY_HEARTBEAT_TOPIC =
+  process.env.SERVER_GATEWAY_HEARTBEAT_TOPIC || 'esp32/heartbeat'
+
+const GW_HEARTBEAT_INTERVAL_MS = Number(process.env.GW_HEARTBEAT_INTERVAL_MS || 5000)
 
 function buildGatewayHeartbeat() {
-  const now = new Date();
   return {
     gateway_id: GATEWAY.id,
     gateway_ip: GATEWAY.ip,
     gateway_mac: GATEWAY.mac,
     status: 'online',
     uptime: Math.floor(process.uptime()),
-    timestamp: now.toISOString(),
-  };
-}
-
-function parseStatusKv(kv) {
-  if (!kv || typeof kv !== 'string') return [];
-  const items = [];
-  const parts = kv.split(';');
-  let device = null;
-  let kind = null;
-  let state = null;
-  parts.forEach((part) => {
-    const [k, v] = part.split('=');
-    if (!k) return;
-    if (k === 'd') {
-      if (device) {
-        items.push({ device, kind: kind || 'digital', state: state ?? 'unknown' });
-      }
-      device = v || null;
-      kind = null;
-      state = null;
-      return;
-    }
-    if (k === 'k') {
-      kind = v || null;
-      return;
-    }
-    if (k === 's') {
-      state = v || null;
-    }
-  });
-  if (device) {
-    items.push({ device, kind: kind || 'digital', state: state ?? 'unknown' });
+    timestamp: new Date().toISOString()
   }
-  return items;
 }
 
-function buildControllerHeartbeat(controllerPayload) {
-  const now = new Date();
-  const nodeId = controllerPayload.node_id || 'node-control-001';
-  const controllerStates = Array.isArray(controllerPayload.controller_states)
-    ? controllerPayload.controller_states
-    : parseStatusKv(controllerPayload.status_kv);
+function publishJson(client, topic, payload) {
+  client.publish(topic, JSON.stringify(payload), { qos: 1 }, (error) => {
+    if (error) {
+      console.error(`[ERR] publish ${topic}: ${error.message}`)
+      return
+    }
+    console.log(`[OK] publish ${topic}: ${JSON.stringify(payload)}`)
+  })
+}
 
-  return {
-    type: 'node_heartbeat',
-    gateway_id: GATEWAY.id,
+function forwardCommandToController(client, payload) {
+  const forwarded = {
+    ...payload,
+    gateway_id: payload.gateway_id || GATEWAY.id,
     gateway_ip: GATEWAY.ip,
     gateway_mac: GATEWAY.mac,
-    node_id: nodeId,
-    node_name: controllerPayload.node_name || nodeId,
-    node_ip: controllerPayload.node_ip || null,
-    node_mac: controllerPayload.node_mac || null,
-    status: controllerPayload.status || 'online',
-    uptime: controllerPayload.uptime ?? null,
-    heartbeat_seq: controllerPayload.heartbeat_seq ?? null,
-    sensor_rssi: controllerPayload.sensor_rssi ?? -55,
-    gateway_timestamp: now.toISOString(),
-    sensor_timestamp: controllerPayload.sensor_timestamp || now.toISOString(),
-    status_kv: controllerPayload.status_kv || null,
-    controller_states: controllerStates,
-    gps: controllerPayload.gps ?? null,
-    lat: controllerPayload.lat ?? null,
-    lng: controllerPayload.lng ?? null,
-    latitude: controllerPayload.latitude ?? null,
-    longitude: controllerPayload.longitude ?? null,
-    connected_nodes: Array.isArray(controllerPayload.connected_nodes)
-      ? controllerPayload.connected_nodes
-      : null,
-  };
+    forwarded_at: new Date().toISOString()
+  }
+  publishJson(client, GATEWAY_TO_CONTROLLER_TOPIC, forwarded)
+}
+
+function forwardControllerUpdateToServer(client, payload) {
+  const updateType = String(payload.type || '').toLowerCase()
+  const enriched = {
+    ...payload,
+    gateway_id: payload.gateway_id || GATEWAY.id,
+    gateway_ip: payload.gateway_ip || GATEWAY.ip,
+    gateway_mac: payload.gateway_mac || GATEWAY.mac
+  }
+
+  if (updateType === 'controller_status_event') {
+    publishJson(client, SERVER_CONTROLLER_STATUS_EVENT_TOPIC, enriched)
+    return
+  }
+
+  publishJson(client, SERVER_CONTROLLER_HEARTBEAT_TOPIC, enriched)
 }
 
 const client = mqtt.connect(BROKER, {
   clientId: `gateway_sim_${Math.random().toString(16).slice(2)}`,
   clean: true,
-  reconnectPeriod: 1000,
-});
+  reconnectPeriod: 1000
+})
 
 client.on('connect', () => {
-  console.log(`Connected to ${BROKER}`);
-  client.subscribe(INBOUND_TOPIC, { qos: 1 }, (err) => {
-    if (err) {
-      console.error(`Subscribe error: ${err.message}`);
-    } else {
-      console.log(`Listening controller -> gateway: ${INBOUND_TOPIC}`);
+  console.log(`Connected to ${BROKER}`)
+
+  client.subscribe([COMMAND_TOPIC, CONTROLLER_TO_GATEWAY_TOPIC], { qos: 1 }, (error) => {
+    if (error) {
+      console.error(`[ERR] subscribe: ${error.message}`)
+      return
     }
-  });
+    console.log(`Subscribed command topic: ${COMMAND_TOPIC}`)
+    console.log(`Subscribed controller uplink topic: ${CONTROLLER_TO_GATEWAY_TOPIC}`)
+  })
 
   setInterval(() => {
-    const hb = buildGatewayHeartbeat();
-    client.publish(GW_HEARTBEAT_TOPIC, JSON.stringify(hb), { qos: 1 }, (err) => {
-      if (!err) {
-        console.log(`[OK] gateway heartbeat -> server (${GW_HEARTBEAT_TOPIC})`);
-      }
-    });
-  }, GW_HEARTBEAT_INTERVAL_MS);
-});
+    publishJson(client, SERVER_GATEWAY_HEARTBEAT_TOPIC, buildGatewayHeartbeat())
+  }, GW_HEARTBEAT_INTERVAL_MS)
+})
 
 client.on('message', (topic, payloadBuf) => {
-  if (topic !== INBOUND_TOPIC) return;
-  let controllerPayload;
+  let payload
   try {
-    controllerPayload = JSON.parse(payloadBuf.toString());
-  } catch (err) {
-    console.error('Invalid controller payload:', err.message);
-    return;
+    payload = JSON.parse(payloadBuf.toString())
+  } catch (error) {
+    console.error(`[ERR] invalid JSON from ${topic}: ${error.message}`)
+    return
   }
 
-  const outPayload = buildControllerHeartbeat(controllerPayload);
-  client.publish(OUTBOUND_TOPIC, JSON.stringify(outPayload), { qos: 1 }, (err) => {
-    if (err) {
-      console.error(`[ERR] gateway -> server: ${err.message}`);
-    } else {
-      console.log(`[OK] gateway -> server (${OUTBOUND_TOPIC}) ${outPayload.node_id}`);
-    }
-  });
-});
+  if (topic === COMMAND_TOPIC) {
+    console.log(`[IN] command from server: ${JSON.stringify(payload)}`)
+    forwardCommandToController(client, payload)
+    return
+  }
 
-client.on('error', (err) => {
-  console.error('MQTT error:', err.message);
-  process.exitCode = 1;
-});
+  if (topic === CONTROLLER_TO_GATEWAY_TOPIC) {
+    console.log(`[IN] update from controller: ${JSON.stringify(payload)}`)
+    forwardControllerUpdateToServer(client, payload)
+  }
+})
+
+client.on('error', (error) => {
+  console.error(`MQTT error: ${error.message}`)
+  process.exitCode = 1
+})
 
 process.on('SIGINT', () => {
-  client.end(true, () => process.exit(0));
-});
+  client.end(true, () => process.exit(0))
+})
