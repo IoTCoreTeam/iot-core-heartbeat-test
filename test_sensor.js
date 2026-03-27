@@ -8,16 +8,17 @@ const HEARTBEAT_INTERVAL_MS = Number(process.env.HEARTBEAT_INTERVAL_MS || 5000);
 const ONCE = process.argv.includes('--once');
 
 const GATEWAY = {
-  id: process.env.GATEWAY_ID || 'GW_001',
+  id: process.env.GATEWAY_ID || 'TEST_GW_001',
+  name: process.env.GATEWAY_NAME || '[TEST] Gateway Simulator 001',
   ip: process.env.GATEWAY_IP || '192.168.1.249',
   mac: process.env.GATEWAY_MAC || '00:70:07:E6:7D:14',
 };
 
 const SENSOR_NODE = {
-  nodeId: process.env.NODE_ID || 'node-sensor-001',
-  nodeName: process.env.NODE_NAME || 'Sensor Node',
+  nodeId: process.env.NODE_ID || 'test-node-sensor-001',
+  nodeName: process.env.NODE_NAME || '[TEST] Sensor Node 001',
   nodeMac: process.env.NODE_MAC || '00:70:07:E5:F2:58',
-  sensorId: process.env.SENSOR_ID || 'sensor-env-01',
+  sensorId: process.env.SENSOR_ID || 'test-sensor-env-01',
 };
 
 const BASE = {
@@ -56,6 +57,7 @@ function buildSensorPayload() {
 
   return {
     gateway_id: GATEWAY.id,
+    gateway_name: GATEWAY.name,
     gateway_ip: GATEWAY.ip,
     gateway_mac: GATEWAY.mac,
     node_id: SENSOR_NODE.nodeId,
@@ -80,6 +82,7 @@ function buildHeartbeatPayload() {
   return {
     type: 'node_heartbeat',
     gateway_id: GATEWAY.id,
+    gateway_name: GATEWAY.name,
     gateway_ip: GATEWAY.ip,
     gateway_mac: GATEWAY.mac,
     node_id: SENSOR_NODE.nodeId,

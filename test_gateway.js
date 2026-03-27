@@ -3,7 +3,8 @@ const mqtt = require('mqtt')
 const BROKER = process.env.MQTT_BROKER || 'mqtt://localhost:1883'
 
 const GATEWAY = {
-  id: process.env.GATEWAY_ID || 'GW_001',
+  id: process.env.GATEWAY_ID || 'TEST_GW_001',
+  name: process.env.GATEWAY_NAME || '[TEST] Gateway Simulator 001',
   ip: process.env.GATEWAY_IP || '192.168.1.249',
   mac: process.env.GATEWAY_MAC || '00:70:07:E6:7D:14'
 }
@@ -15,6 +16,8 @@ const GATEWAY_TO_CONTROLLER_TOPIC =
   process.env.GATEWAY_TO_CONTROLLER_TOPIC || 'esp32/gateway/control-command'
 const CONTROLLER_TO_GATEWAY_TOPIC =
   process.env.CONTROLLER_TO_GATEWAY_TOPIC || 'esp32/gateway/controller-updates'
+const LEGACY_CONTROLLER_TO_GATEWAY_TOPIC =
+  process.env.LEGACY_CONTROLLER_TO_GATEWAY_TOPIC || 'esp32/gateway/controller'
 
 const SERVER_CONTROLLER_HEARTBEAT_TOPIC =
   process.env.SERVER_CONTROLLER_HEARTBEAT_TOPIC || 'esp32/controllers/heartbeat'
@@ -28,6 +31,7 @@ const GW_HEARTBEAT_INTERVAL_MS = Number(process.env.GW_HEARTBEAT_INTERVAL_MS || 
 function buildGatewayHeartbeat() {
   return {
     gateway_id: GATEWAY.id,
+    gateway_name: GATEWAY.name,
     gateway_ip: GATEWAY.ip,
     gateway_mac: GATEWAY.mac,
     status: 'online',
@@ -50,6 +54,7 @@ function forwardCommandToController(client, payload) {
   const forwarded = {
     ...payload,
     gateway_id: payload.gateway_id || GATEWAY.id,
+    gateway_name: payload.gateway_name || GATEWAY.name,
     gateway_ip: GATEWAY.ip,
     gateway_mac: GATEWAY.mac,
     forwarded_at: new Date().toISOString()
@@ -58,10 +63,11 @@ function forwardCommandToController(client, payload) {
 }
 
 function forwardControllerUpdateToServer(client, payload) {
-  const updateType = String(payload.type || '').toLowerCase()
+  const updateType = String(payload.event_type || payload.type || '').toLowerCase()
   const enriched = {
     ...payload,
     gateway_id: payload.gateway_id || GATEWAY.id,
+    gateway_name: payload.gateway_name || GATEWAY.name,
     gateway_ip: payload.gateway_ip || GATEWAY.ip,
     gateway_mac: payload.gateway_mac || GATEWAY.mac
   }
@@ -83,13 +89,21 @@ const client = mqtt.connect(BROKER, {
 client.on('connect', () => {
   console.log(`Connected to ${BROKER}`)
 
-  client.subscribe([COMMAND_TOPIC, CONTROLLER_TO_GATEWAY_TOPIC], { qos: 1 }, (error) => {
+  const subscribedTopics = [COMMAND_TOPIC, CONTROLLER_TO_GATEWAY_TOPIC]
+  if (LEGACY_CONTROLLER_TO_GATEWAY_TOPIC !== CONTROLLER_TO_GATEWAY_TOPIC) {
+    subscribedTopics.push(LEGACY_CONTROLLER_TO_GATEWAY_TOPIC)
+  }
+
+  client.subscribe(subscribedTopics, { qos: 1 }, (error) => {
     if (error) {
       console.error(`[ERR] subscribe: ${error.message}`)
       return
     }
     console.log(`Subscribed command topic: ${COMMAND_TOPIC}`)
     console.log(`Subscribed controller uplink topic: ${CONTROLLER_TO_GATEWAY_TOPIC}`)
+    if (LEGACY_CONTROLLER_TO_GATEWAY_TOPIC !== CONTROLLER_TO_GATEWAY_TOPIC) {
+      console.log(`Subscribed legacy controller uplink topic: ${LEGACY_CONTROLLER_TO_GATEWAY_TOPIC}`)
+    }
   })
 
   setInterval(() => {
@@ -112,7 +126,7 @@ client.on('message', (topic, payloadBuf) => {
     return
   }
 
-  if (topic === CONTROLLER_TO_GATEWAY_TOPIC) {
+  if (topic === CONTROLLER_TO_GATEWAY_TOPIC || topic === LEGACY_CONTROLLER_TO_GATEWAY_TOPIC) {
     console.log(`[IN] update from controller: ${JSON.stringify(payload)}`)
     forwardControllerUpdateToServer(client, payload)
   }

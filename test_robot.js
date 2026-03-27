@@ -15,47 +15,57 @@ const GATEWAY = {
   mac: process.env.GATEWAY_MAC || '00:70:07:E6:7D:14'
 }
 
-const CONTROLLER = {
-  id: process.env.NODE_ID || 'test-node-control-001',
-  name: process.env.NODE_NAME || '[TEST] Control Node 001',
-  mac: process.env.NODE_MAC || '24:6F:28:AA:BB:01',
-  sensorId: process.env.DEVICE_ID || 'test-actuator-control-001'
+const ROBOT = {
+  id: process.env.NODE_ID || 'test-node-robot-001',
+  name: process.env.NODE_NAME || '[TEST] Robot Node 001',
+  mac: process.env.NODE_MAC || '24:6F:28:AA:CC:01',
+  sensorId: process.env.DEVICE_ID || 'test-actuator-robot-001'
 }
 
 const DEVICES = {
-  primary: process.env.DIGITAL_DEVICE || 'test_pump',
-  secondary: process.env.SECONDARY_DIGITAL_DEVICE || 'test_light'
+  primary: process.env.ROBOT_DEVICE || 'ground-control'
 }
 
 let heartbeatSeq = 0
 let eventSeq = 0
 let fallbackCommandSeq = 0
 
-let primaryOn = false
-let secondaryOn = false
+let robotMode = 'digital' // digital | analog
+let robotState = 'off' // for digital
+let robotValue = 0 // for analog
 
 function currentDeviceStates() {
   return [
-    { device: DEVICES.primary, kind: 'digital', state: primaryOn ? 'on' : 'off' },
-    { device: DEVICES.secondary, kind: 'digital', state: secondaryOn ? 'on' : 'off' }
+    {
+      device: DEVICES.primary,
+      kind: 'json_command',
+      state: robotMode === 'digital' ? robotState : null,
+      value: null
+    }
   ]
 }
 
 function buildStatusKv(states, commandMeta = null) {
-  const parts = ['v=1']
+  const parts = ['v=1', 'it=json_command']
 
   if (commandMeta) {
     parts.push(`cmd=${String(commandMeta.seq)}`)
     parts.push(`ce=${String(commandMeta.execMs)}`)
     parts.push(`cd=${String(commandMeta.device)}`)
+    parts.push(`cm=${String(commandMeta.mode)}`)
     parts.push(`ct=${String(commandMeta.state)}`)
+    parts.push(`cv=${String(commandMeta.value)}`)
     parts.push(`cr=${String(commandMeta.result)}`)
   }
 
   for (const state of states) {
     parts.push(`d=${state.device}`)
     parts.push(`k=${state.kind}`)
-    parts.push(`s=${state.state}`)
+    if (state.kind === 'digital') {
+      parts.push(`s=${state.state}`)
+    } else {
+      parts.push(`v=${String(state.value)}`)
+    }
   }
 
   return parts.join(';')
@@ -63,9 +73,15 @@ function buildStatusKv(states, commandMeta = null) {
 
 function normalizeDigitalState(value) {
   const normalized = String(value || '').trim().toLowerCase()
-  if (normalized === 'on') return true
-  if (normalized === 'off') return false
+  if (normalized === 'on') return 'on'
+  if (normalized === 'off') return 'off'
   return null
+}
+
+function normalizeAnalogValue(value) {
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric)) return null
+  return numeric
 }
 
 function applyCommand(command) {
@@ -73,47 +89,67 @@ function applyCommand(command) {
     return null
   }
 
-  const nodeId = String(command.node_id || CONTROLLER.id)
-  if (nodeId !== CONTROLLER.id) {
+  const nodeId = String(command.node_id || ROBOT.id)
+  if (nodeId !== ROBOT.id) {
     return null
   }
 
   const startedAt = Date.now()
-  const device = String(command.device || '')
+  const device = String(command.device || DEVICES.primary)
   const seq = Number(command.command_seq) > 0 ? Number(command.command_seq) : ++fallbackCommandSeq
-  const requestedState = String(command.state || '').toLowerCase()
+  const payload = command.command_payload && typeof command.command_payload === 'object'
+    ? command.command_payload
+    : null
 
-  let result = 'unknown_device'
-  let appliedState = requestedState
+  let result = 'invalid_payload'
+  let appliedMode = robotMode
+  let appliedState = robotMode === 'digital' ? robotState : null
+  let appliedValue = robotMode === 'analog' ? robotValue : null
 
-  if (device === DEVICES.primary) {
-    const next = normalizeDigitalState(requestedState)
-    if (next === null) {
-      result = 'invalid_state'
+  if (device !== DEVICES.primary) {
+    result = 'unknown_device'
+  } else if (!payload) {
+    result = 'missing_command_payload'
+  } else {
+    const mode = String(payload.mode || '').trim().toLowerCase()
+    const value = payload.value
+
+    if (mode === 'digital') {
+      const nextState = normalizeDigitalState(value)
+      if (nextState === null) {
+        result = 'invalid_state'
+      } else {
+        robotMode = 'digital'
+        robotState = nextState
+        result = 'applied'
+      }
+    } else if (mode === 'analog') {
+      const nextValue = normalizeAnalogValue(value)
+      if (nextValue === null) {
+        result = 'invalid_value'
+      } else {
+        robotMode = 'analog'
+        robotValue = nextValue
+        result = 'applied'
+      }
     } else {
-      primaryOn = next
-      result = 'applied'
-      appliedState = next ? 'on' : 'off'
+      result = 'invalid_mode'
     }
-  } else if (device === DEVICES.secondary) {
-    const next = normalizeDigitalState(requestedState)
-    if (next === null) {
-      result = 'invalid_state'
-    } else {
-      secondaryOn = next
-      result = 'applied'
-      appliedState = next ? 'on' : 'off'
-    }
+
+    appliedMode = robotMode
+    appliedState = robotMode === 'digital' ? robotState : null
+    appliedValue = robotMode === 'analog' ? robotValue : null
   }
 
-  // Simulate controller processing time.
   const jitterMs = Math.floor(Math.random() * 40)
   const execMs = Date.now() - startedAt + jitterMs
 
   return {
     seq,
     device,
+    mode: appliedMode,
     state: appliedState,
+    value: appliedValue,
     result,
     execMs
   }
@@ -135,16 +171,18 @@ function buildHeartbeatPayload() {
   heartbeatSeq += 1
 
   return {
-    type: 'node_heartbeat',
+    type: 'control',
+    event_type: 'node_heartbeat',
     node_type: 'node-control',
+    input_type: 'json_command',
     gateway_id: GATEWAY.id,
     gateway_name: GATEWAY.name,
     gateway_ip: GATEWAY.ip,
     gateway_mac: GATEWAY.mac,
-    node_id: CONTROLLER.id,
-    node_name: CONTROLLER.name,
-    node_mac: CONTROLLER.mac,
-    sensor_id: CONTROLLER.sensorId,
+    node_id: ROBOT.id,
+    node_name: ROBOT.name,
+    node_mac: ROBOT.mac,
+    sensor_id: ROBOT.sensorId,
     status: 'online',
     uptime: Math.floor(process.uptime()),
     heartbeat_seq: heartbeatSeq,
@@ -166,15 +204,17 @@ function publishStatusEvent(client, command, commandResult) {
   eventSeq += 1
 
   const payload = {
-    type: 'controller_status_event',
+    type: 'control',
+    event_type: 'controller_status_event',
     node_type: 'node-control',
+    input_type: 'json_command',
     gateway_id: command.gateway_id || GATEWAY.id,
     gateway_name: command.gateway_name || GATEWAY.name,
     gateway_ip: command.gateway_ip || GATEWAY.ip,
     gateway_mac: command.gateway_mac || GATEWAY.mac,
-    node_id: CONTROLLER.id,
-    node_mac: CONTROLLER.mac,
-    sensor_id: CONTROLLER.sensorId,
+    node_id: ROBOT.id,
+    node_mac: ROBOT.mac,
+    sensor_id: ROBOT.sensorId,
     event_seq: eventSeq,
     sensor_rssi: -45,
     sensor_timestamp: now,
@@ -182,12 +222,15 @@ function publishStatusEvent(client, command, commandResult) {
     status_kv: buildStatusKv(controllerStates, commandResult),
     command_seq: commandResult.seq,
     command_device: commandResult.device,
+    command_mode: commandResult.mode,
     command_state: commandResult.state,
+    command_value: commandResult.value,
     command_result: commandResult.result,
     command_exec_ms: commandResult.execMs,
     requested_at: command.requested_at || null,
     requested_at_ms: command.requested_at_ms || null,
     response_deadline_at: command.response_deadline_at || null,
+    command_payload: command.command_payload || null,
     controller_states: controllerStates
   }
 
@@ -195,7 +238,7 @@ function publishStatusEvent(client, command, commandResult) {
 }
 
 const client = mqtt.connect(BROKER, {
-  clientId: `controller_sim_${Math.random().toString(16).slice(2)}`,
+  clientId: `robot_sim_${Math.random().toString(16).slice(2)}`,
   clean: true,
   reconnectPeriod: 1000
 })
@@ -231,12 +274,12 @@ client.on('message', (topic, payloadBuf) => {
 
   const result = applyCommand(command)
   if (!result) {
-    console.log(`[SKIP] command is not for node ${CONTROLLER.id}`)
+    console.log(`[SKIP] command is not for node ${ROBOT.id}`)
     return
   }
 
   console.log(
-    `[CMD] node=${CONTROLLER.id} seq=${result.seq} device=${result.device} state=${result.state} result=${result.result} exec_ms=${result.execMs}`
+    `[CMD] node=${ROBOT.id} seq=${result.seq} device=${result.device} mode=${result.mode} state=${result.state} value=${result.value} result=${result.result} exec_ms=${result.execMs}`
   )
   publishStatusEvent(client, command, result)
 })
