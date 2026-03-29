@@ -26,21 +26,28 @@ const DEVICES = {
   primary: process.env.ROBOT_DEVICE || 'ground-control'
 }
 
+const BASE_LAT = Number(process.env.GPS_LAT || 20.8459)
+const BASE_LNG = Number(process.env.GPS_LNG || 106.6902)
+const MOVE_STEP_METERS = Number(process.env.ROBOT_MOVE_STEP_METERS || 5)
+const MOVE_STEPS_PER_HEARTBEAT = Number(process.env.ROBOT_MOVE_STEPS_PER_HEARTBEAT || 3)
+
 let heartbeatSeq = 0
 let eventSeq = 0
 let fallbackCommandSeq = 0
 
-let robotMode = 'digital' // digital | analog
-let robotState = 'off' // for digital
-let robotValue = 0 // for analog
+let robotMode = 'digital'
+let robotState = 'off' // for digital on/off status
+let robotDirection = 'idle' // movement semantic for json command
+let robotLat = BASE_LAT
+let robotLng = BASE_LNG
 
 function currentDeviceStates() {
   return [
     {
       device: DEVICES.primary,
       kind: 'json_command',
-      state: robotMode === 'digital' ? robotState : null,
-      value: null
+      state: robotState,
+      value: robotDirection
     }
   ]
 }
@@ -78,10 +85,46 @@ function normalizeDigitalState(value) {
   return null
 }
 
-function normalizeAnalogValue(value) {
-  const numeric = Number(value)
-  if (!Number.isFinite(numeric)) return null
-  return numeric
+function normalizeDirection(value) {
+  const normalized = String(value || '').trim().toLowerCase()
+  if (['forward', 'backward', 'left', 'right', 'stop'].includes(normalized)) {
+    return normalized
+  }
+  return null
+}
+
+function moveRobot(direction) {
+  if (direction === 'stop') return
+
+  const meters = Number.isFinite(MOVE_STEP_METERS) && MOVE_STEP_METERS > 0
+    ? MOVE_STEP_METERS
+    : 2
+  const latStep = meters / 111320
+  const cosLat = Math.max(Math.cos((robotLat * Math.PI) / 180), 0.1)
+  const lngStep = meters / (111320 * cosLat)
+
+  if (direction === 'forward') {
+    robotLat += latStep
+  } else if (direction === 'backward') {
+    robotLat -= latStep
+  } else if (direction === 'right') {
+    robotLng += lngStep
+  } else if (direction === 'left') {
+    robotLng -= lngStep
+  }
+}
+
+function moveRobotByHeartbeat() {
+  if (robotState !== 'on') return
+  if (robotDirection === 'stop' || robotDirection === 'idle') return
+
+  const steps = Number.isFinite(MOVE_STEPS_PER_HEARTBEAT) && MOVE_STEPS_PER_HEARTBEAT > 0
+    ? Math.floor(MOVE_STEPS_PER_HEARTBEAT)
+    : 1
+
+  for (let i = 0; i < steps; i += 1) {
+    moveRobot(robotDirection)
+  }
 }
 
 function applyCommand(command) {
@@ -103,8 +146,8 @@ function applyCommand(command) {
 
   let result = 'invalid_payload'
   let appliedMode = robotMode
-  let appliedState = robotMode === 'digital' ? robotState : null
-  let appliedValue = robotMode === 'analog' ? robotValue : null
+  let appliedState = robotState
+  let appliedValue = robotDirection
 
   if (device !== DEVICES.primary) {
     result = 'unknown_device'
@@ -112,24 +155,25 @@ function applyCommand(command) {
     result = 'missing_command_payload'
   } else {
     const mode = String(payload.mode || '').trim().toLowerCase()
-    const value = payload.value
-
     if (mode === 'digital') {
-      const nextState = normalizeDigitalState(value)
-      if (nextState === null) {
-        result = 'invalid_state'
+      const rawValue = String(payload.value ?? '').trim().toLowerCase()
+      let direction = null
+
+      if (['off', '0', 'false', 'stop', 'idle'].includes(rawValue)) {
+        direction = 'stop'
+      } else if (['forward', 'backward', 'left', 'right'].includes(rawValue)) {
+        direction = rawValue
+      } else {
+        direction = normalizeDirection(payload.direction)
+      }
+
+      if (direction === null) {
+        result = 'invalid_direction'
       } else {
         robotMode = 'digital'
-        robotState = nextState
-        result = 'applied'
-      }
-    } else if (mode === 'analog') {
-      const nextValue = normalizeAnalogValue(value)
-      if (nextValue === null) {
-        result = 'invalid_value'
-      } else {
-        robotMode = 'analog'
-        robotValue = nextValue
+        robotDirection = direction
+        robotState = direction === 'stop' ? 'off' : 'on'
+        moveRobot(direction)
         result = 'applied'
       }
     } else {
@@ -137,8 +181,8 @@ function applyCommand(command) {
     }
 
     appliedMode = robotMode
-    appliedState = robotMode === 'digital' ? robotState : null
-    appliedValue = robotMode === 'analog' ? robotValue : null
+    appliedState = robotState
+    appliedValue = robotDirection
   }
 
   const jitterMs = Math.floor(Math.random() * 40)
@@ -166,9 +210,20 @@ function publishJson(client, topic, payload) {
 }
 
 function buildHeartbeatPayload() {
+  moveRobotByHeartbeat()
+
   const now = new Date().toISOString()
   const controllerStates = currentDeviceStates()
   heartbeatSeq += 1
+  const lat = robotLat
+  const lng = robotLng
+  const gps = {
+    lat,
+    lng,
+    satellites: 8 + (heartbeatSeq % 4),
+    hdop: 0.7 + ((heartbeatSeq % 6) * 0.05),
+    timestamp: now
+  }
 
   return {
     type: 'control',
@@ -189,6 +244,9 @@ function buildHeartbeatPayload() {
     sensor_rssi: -45,
     gateway_timestamp: now,
     sensor_timestamp: now,
+    gps,
+    lat,
+    lng,
     status_kv: buildStatusKv(controllerStates),
     controller_states: controllerStates
   }
@@ -225,6 +283,7 @@ function publishStatusEvent(client, command, commandResult) {
     command_mode: commandResult.mode,
     command_state: commandResult.state,
     command_value: commandResult.value,
+    command_direction: commandResult.value,
     command_result: commandResult.result,
     command_exec_ms: commandResult.execMs,
     requested_at: command.requested_at || null,

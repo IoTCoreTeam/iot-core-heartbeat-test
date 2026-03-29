@@ -24,7 +24,8 @@ const CONTROLLER = {
 
 const DEVICES = {
   primary: process.env.DIGITAL_DEVICE || 'test_pump',
-  secondary: process.env.SECONDARY_DIGITAL_DEVICE || 'test_light'
+  secondary: process.env.SECONDARY_DIGITAL_DEVICE || 'test_light',
+  fan: process.env.ANALOG_FAN_DEVICE || 'test_fan'
 }
 
 let heartbeatSeq = 0
@@ -33,11 +34,13 @@ let fallbackCommandSeq = 0
 
 let primaryOn = false
 let secondaryOn = false
+let fanValue = Number(process.env.FAN_DEFAULT_VALUE || 0)
 
 function currentDeviceStates() {
   return [
     { device: DEVICES.primary, kind: 'digital', state: primaryOn ? 'on' : 'off' },
-    { device: DEVICES.secondary, kind: 'digital', state: secondaryOn ? 'on' : 'off' }
+    { device: DEVICES.secondary, kind: 'digital', state: secondaryOn ? 'on' : 'off' },
+    { device: DEVICES.fan, kind: 'analog', value: fanValue }
   ]
 }
 
@@ -49,13 +52,18 @@ function buildStatusKv(states, commandMeta = null) {
     parts.push(`ce=${String(commandMeta.execMs)}`)
     parts.push(`cd=${String(commandMeta.device)}`)
     parts.push(`ct=${String(commandMeta.state)}`)
+    parts.push(`cv=${String(commandMeta.value)}`)
     parts.push(`cr=${String(commandMeta.result)}`)
   }
 
   for (const state of states) {
     parts.push(`d=${state.device}`)
     parts.push(`k=${state.kind}`)
-    parts.push(`s=${state.state}`)
+    if (state.kind === 'digital') {
+      parts.push(`s=${state.state}`)
+    } else {
+      parts.push(`v=${String(state.value)}`)
+    }
   }
 
   return parts.join(';')
@@ -66,6 +74,12 @@ function normalizeDigitalState(value) {
   if (normalized === 'on') return true
   if (normalized === 'off') return false
   return null
+}
+
+function normalizeAnalogValue(value) {
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric)) return null
+  return numeric
 }
 
 function applyCommand(command) {
@@ -82,9 +96,11 @@ function applyCommand(command) {
   const device = String(command.device || '')
   const seq = Number(command.command_seq) > 0 ? Number(command.command_seq) : ++fallbackCommandSeq
   const requestedState = String(command.state || '').toLowerCase()
+  const requestedValue = command.value
 
   let result = 'unknown_device'
   let appliedState = requestedState
+  let appliedValue = requestedValue ?? null
 
   if (device === DEVICES.primary) {
     const next = normalizeDigitalState(requestedState)
@@ -104,6 +120,16 @@ function applyCommand(command) {
       result = 'applied'
       appliedState = next ? 'on' : 'off'
     }
+  } else if (device === DEVICES.fan) {
+    const next = normalizeAnalogValue(requestedValue)
+    if (next === null) {
+      result = 'invalid_value'
+    } else {
+      fanValue = next
+      result = 'applied'
+      appliedState = 'analog'
+      appliedValue = fanValue
+    }
   }
 
   // Simulate controller processing time.
@@ -114,6 +140,7 @@ function applyCommand(command) {
     seq,
     device,
     state: appliedState,
+    value: appliedValue,
     result,
     execMs
   }
@@ -183,6 +210,7 @@ function publishStatusEvent(client, command, commandResult) {
     command_seq: commandResult.seq,
     command_device: commandResult.device,
     command_state: commandResult.state,
+    command_value: commandResult.value,
     command_result: commandResult.result,
     command_exec_ms: commandResult.execMs,
     requested_at: command.requested_at || null,
@@ -236,7 +264,7 @@ client.on('message', (topic, payloadBuf) => {
   }
 
   console.log(
-    `[CMD] node=${CONTROLLER.id} seq=${result.seq} device=${result.device} state=${result.state} result=${result.result} exec_ms=${result.execMs}`
+    `[CMD] node=${CONTROLLER.id} seq=${result.seq} device=${result.device} state=${result.state} value=${result.value} result=${result.result} exec_ms=${result.execMs}`
   )
   publishStatusEvent(client, command, result)
 })
