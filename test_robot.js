@@ -30,6 +30,7 @@ const BASE_LAT = Number(process.env.GPS_LAT || 20.8459)
 const BASE_LNG = Number(process.env.GPS_LNG || 106.6902)
 const MOVE_STEP_METERS = Number(process.env.ROBOT_MOVE_STEP_METERS || 5)
 const MOVE_STEPS_PER_HEARTBEAT = Number(process.env.ROBOT_MOVE_STEPS_PER_HEARTBEAT || 3)
+const TURN_STEP_DEG = Number(process.env.ROBOT_TURN_STEP_DEG || 15)
 
 let heartbeatSeq = 0
 let eventSeq = 0
@@ -40,6 +41,7 @@ let robotState = 'off' // for digital on/off status
 let robotDirection = 'idle' // movement semantic for json command
 let robotLat = BASE_LAT
 let robotLng = BASE_LNG
+let robotHeadingDeg = 0
 
 function currentDeviceStates() {
   return [
@@ -99,18 +101,26 @@ function moveRobot(direction) {
   const meters = Number.isFinite(MOVE_STEP_METERS) && MOVE_STEP_METERS > 0
     ? MOVE_STEP_METERS
     : 2
-  const latStep = meters / 111320
+  const turnStepDeg = Number.isFinite(TURN_STEP_DEG) && TURN_STEP_DEG > 0
+    ? TURN_STEP_DEG
+    : 15
+  const headingRad = (robotHeadingDeg * Math.PI) / 180
+  const northMeters = Math.cos(headingRad) * meters
+  const eastMeters = Math.sin(headingRad) * meters
+  const latStep = northMeters / 111320
   const cosLat = Math.max(Math.cos((robotLat * Math.PI) / 180), 0.1)
-  const lngStep = meters / (111320 * cosLat)
+  const lngStep = eastMeters / (111320 * cosLat)
 
   if (direction === 'forward') {
     robotLat += latStep
+    robotLng += lngStep
   } else if (direction === 'backward') {
     robotLat -= latStep
-  } else if (direction === 'right') {
-    robotLng += lngStep
-  } else if (direction === 'left') {
     robotLng -= lngStep
+  } else if (direction === 'right') {
+    robotHeadingDeg = (robotHeadingDeg + turnStepDeg) % 360
+  } else if (direction === 'left') {
+    robotHeadingDeg = (robotHeadingDeg - turnStepDeg + 360) % 360
   }
 }
 
@@ -125,6 +135,33 @@ function moveRobotByHeartbeat() {
   for (let i = 0; i < steps; i += 1) {
     moveRobot(robotDirection)
   }
+}
+
+function getHeadingInfo(headingDeg) {
+  const normalized = ((Number(headingDeg) % 360) + 360) % 360
+
+  if (normalized >= 337.5 || normalized < 22.5) {
+    return { headingDeg: normalized, headingCardinal: 'N' }
+  }
+  if (normalized < 67.5) {
+    return { headingDeg: normalized, headingCardinal: 'NE' }
+  }
+  if (normalized < 112.5) {
+    return { headingDeg: normalized, headingCardinal: 'E' }
+  }
+  if (normalized < 157.5) {
+    return { headingDeg: normalized, headingCardinal: 'SE' }
+  }
+  if (normalized < 202.5) {
+    return { headingDeg: normalized, headingCardinal: 'S' }
+  }
+  if (normalized < 247.5) {
+    return { headingDeg: normalized, headingCardinal: 'SW' }
+  }
+  if (normalized < 292.5) {
+    return { headingDeg: normalized, headingCardinal: 'W' }
+  }
+  return { headingDeg: normalized, headingCardinal: 'NW' }
 }
 
 function applyCommand(command) {
@@ -217,9 +254,13 @@ function buildHeartbeatPayload() {
   heartbeatSeq += 1
   const lat = robotLat
   const lng = robotLng
+  const heading = getHeadingInfo(robotHeadingDeg)
   const gps = {
     lat,
     lng,
+    heading_deg: heading.headingDeg,
+    heading_cardinal: heading.headingCardinal,
+    heading_source: 'simulated_from_command',
     satellites: 8 + (heartbeatSeq % 4),
     hdop: 0.7 + ((heartbeatSeq % 6) * 0.05),
     timestamp: now
