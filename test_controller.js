@@ -7,6 +7,8 @@ const CONTROLLER_TO_GATEWAY_TOPIC =
   process.env.CONTROLLER_TO_GATEWAY_TOPIC || 'esp32/gateway/controller-updates'
 const HEARTBEAT_INTERVAL_MS = Number(process.env.INTERVAL_MS || 5000)
 const ONCE = process.argv.includes('--once')
+const STATUS_EVENT_RETRY_MS = Number(process.env.STATUS_EVENT_RETRY_MS || 1500)
+const COMMAND_DEDUP_WINDOW = Number(process.env.COMMAND_DEDUP_WINDOW || 100)
 
 const GATEWAY = {
   id: process.env.GATEWAY_ID || 'TEST_GW_001',
@@ -31,10 +33,13 @@ const DEVICES = {
 let heartbeatSeq = 0
 let eventSeq = 0
 let fallbackCommandSeq = 0
+let statusEventRetryTimer = null
+let pendingStatusEvent = null
 
 let primaryOn = false
 let secondaryOn = false
 let fanValue = Number(process.env.FAN_DEFAULT_VALUE || 0)
+const recentCommandSeqs = []
 
 function currentDeviceStates() {
   return [
@@ -156,6 +161,65 @@ function publishJson(client, topic, payload) {
   })
 }
 
+function publishJsonWithResult(client, topic, payload, handlers = {}) {
+  client.publish(topic, JSON.stringify(payload), { qos: 1 }, (error) => {
+    if (error) {
+      console.error(`[ERR] publish ${topic}: ${error.message}`)
+      if (typeof handlers.onError === 'function') {
+        handlers.onError(error)
+      }
+      return
+    }
+    console.log(`[OK] publish ${topic}: ${JSON.stringify(payload)}`)
+    if (typeof handlers.onSuccess === 'function') {
+      handlers.onSuccess()
+    }
+  })
+}
+
+function rememberProcessedSeq(seq) {
+  recentCommandSeqs.push(seq)
+  if (recentCommandSeqs.length > COMMAND_DEDUP_WINDOW) {
+    recentCommandSeqs.shift()
+  }
+}
+
+function hasProcessedSeq(seq) {
+  return recentCommandSeqs.includes(seq)
+}
+
+function queueStatusEventRetry(client) {
+  if (statusEventRetryTimer || !pendingStatusEvent) {
+    return
+  }
+  statusEventRetryTimer = setTimeout(() => {
+    statusEventRetryTimer = null
+    flushPendingStatusEvent(client)
+  }, STATUS_EVENT_RETRY_MS)
+}
+
+function flushPendingStatusEvent(client) {
+  if (!pendingStatusEvent) {
+    return
+  }
+  if (!client.connected) {
+    queueStatusEventRetry(client)
+    return
+  }
+
+  const { payload, commandSeq } = pendingStatusEvent
+  publishJsonWithResult(client, CONTROLLER_TO_GATEWAY_TOPIC, payload, {
+    onSuccess: () => {
+      if (pendingStatusEvent && pendingStatusEvent.commandSeq === commandSeq) {
+        pendingStatusEvent = null
+      }
+    },
+    onError: () => {
+      queueStatusEventRetry(client)
+    }
+  })
+}
+
 function buildHeartbeatPayload() {
   const now = new Date().toISOString()
   const controllerStates = currentDeviceStates()
@@ -219,7 +283,11 @@ function publishStatusEvent(client, command, commandResult) {
     controller_states: controllerStates
   }
 
-  publishJson(client, CONTROLLER_TO_GATEWAY_TOPIC, payload)
+  pendingStatusEvent = {
+    commandSeq: commandResult.seq,
+    payload
+  }
+  flushPendingStatusEvent(client)
 }
 
 const client = mqtt.connect(BROKER, {
@@ -239,8 +307,12 @@ client.on('connect', () => {
   })
 
   publishHeartbeat(client)
+  flushPendingStatusEvent(client)
   if (!ONCE) {
-    setInterval(() => publishHeartbeat(client), HEARTBEAT_INTERVAL_MS)
+    setInterval(() => {
+      publishHeartbeat(client)
+      flushPendingStatusEvent(client)
+    }, HEARTBEAT_INTERVAL_MS)
   }
 })
 
@@ -262,6 +334,11 @@ client.on('message', (topic, payloadBuf) => {
     console.log(`[SKIP] command is not for node ${CONTROLLER.id}`)
     return
   }
+  if (hasProcessedSeq(result.seq)) {
+    console.log(`[SKIP] duplicate command seq=${result.seq}`)
+    return
+  }
+  rememberProcessedSeq(result.seq)
 
   console.log(
     `[CMD] node=${CONTROLLER.id} seq=${result.seq} device=${result.device} state=${result.state} value=${result.value} result=${result.result} exec_ms=${result.execMs}`
